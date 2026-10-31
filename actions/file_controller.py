@@ -314,6 +314,12 @@ def move_file(path: str, name: str = "", destination: str = "") -> str:
         if dst.is_dir():
             dst = dst / src.name
 
+        # Refuse to overwrite. shutil.move replaces an existing file silently,
+        # and the undo only moves the source back — the replaced file is lost.
+        if dst.exists():
+            return (f"Not moved: '{dst.name}' already exists in {dst.parent.name}/. "
+                    f"Choose another destination or rename it first.")
+
         dst.parent.mkdir(parents=True, exist_ok=True)
         origin = src.resolve()
         shutil.move(str(src), str(dst))
@@ -342,6 +348,12 @@ def copy_file(path: str, name: str = "", destination: str = "") -> str:
 
         if dst.is_dir():
             dst = dst / src.name
+
+        # Refuse to overwrite. The undo for a copy deletes the copy, so an
+        # overwritten file would be gone with nothing left to restore it from.
+        if dst.exists():
+            return (f"Not copied: '{dst.name}' already exists in {dst.parent.name}/. "
+                    f"Choose another destination or rename it first.")
 
         dst.parent.mkdir(parents=True, exist_ok=True)
 
