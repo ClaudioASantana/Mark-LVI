@@ -455,7 +455,10 @@ def _ensure_network_access(*ports: int) -> None:
         code referred to a single `port` that this function never received."""
         try:  # ufw
             r = subprocess.run(["ufw", "status"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5)
-            if "active" in r.stdout.lower():
+            # Match the status line, not the word. "Status: inactive" contains
+            # "active", so a substring test treated a disabled firewall as an
+            # enabled one and stopped before checking the others.
+            if re.search(r"^Status:\s*active\b", r.stdout, re.IGNORECASE | re.MULTILINE):
                 if _privileged(["ufw", "allow", f"{port}/tcp"]):
                     print(f"[Dashboard] ufw: port {port} allowed.")
                 else:
