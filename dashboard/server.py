@@ -140,14 +140,56 @@ def _decrypt(aes_key: bytes, enc_b64: str) -> str:
 _BLOCK_CACHE = None
 
 
-def blocking_firewall_rules() -> list:
-    """Inbound Windows BLOCK rules aimed at the interpreter running this app.
+def _interpreter_exes() -> list:
+    """This interpreter and its sibling (python.exe <-> pythonw.exe).
 
-    Public, read-only and never elevated, so the interface can warn about the
-    one failure that is invisible from inside the app: a block rule overrides
-    every allow rule, so the server listens correctly and the phone still
-    cannot reach it. Empty on every other platform and whenever nothing is
-    blocked.
+    Both, because the app runs under either one and Windows Firewall rules are
+    per executable: allowing one says nothing about the other.
+    """
+    import os, sys
+    py_exe = sys.executable
+    sibling = os.path.join(
+        os.path.dirname(py_exe),
+        "pythonw.exe" if py_exe.lower().endswith("python.exe") else "python.exe")
+    exes = [py_exe]
+    if os.path.exists(sibling):
+        exes.append(sibling)
+    return exes
+
+
+def _parse_blocking_rules(netsh_output: str, wanted: set) -> list:
+    """Which BLOCK rules in `netsh advfirewall firewall show rule ... verbose`
+    apply to one of `wanted` (lowercase program paths).
+
+    Pure, so it can be tested on any machine.
+    """
+    found: list = []
+    name = program = None
+    for line in netsh_output.splitlines():
+        if line.startswith("Rule Name:"):
+            name = line.split(":", 1)[1].strip()
+            program = None
+        elif line.startswith("Program:"):
+            program = line.split(":", 1)[1].strip().lower()
+        elif line.startswith("Action:"):
+            if (name and program and program in wanted
+                    and line.split(":", 1)[1].strip().lower() == "block"
+                    and (name, program) not in found):
+                found.append((name, program))
+    return found
+
+
+_BLOCK_CACHE = None
+
+
+def blocking_firewall_rules(fresh: bool = False) -> list:
+    """Inbound Windows BLOCK rules aimed at this app's interpreters.
+
+    Public, read-only and never elevated. Empty on every other platform.
+
+    Cached for the process, because reading every inbound rule takes about a
+    second. `fresh=True` reads the firewall again. Use it whenever the answer is
+    checked after a change, or the cache reports the state from before it.
 
     -> [(rule name, program path), ...]
     """
@@ -155,25 +197,12 @@ def blocking_firewall_rules() -> list:
     if sys.platform != "win32":
         return []
 
-    # Cached for the process. Reading every inbound rule costs about a second,
-    # and this is called from the Qt thread when the Remote Control panel
-    # opens — a second of frozen interface every time, for an answer that only
-    # changes when somebody edits their firewall.
     global _BLOCK_CACHE
-    if _BLOCK_CACHE is not None:
+    if _BLOCK_CACHE is not None and not fresh:
         return _BLOCK_CACHE
-    import os
+
     import subprocess
-
-    py_exe = sys.executable
-    sibling = os.path.join(
-        os.path.dirname(py_exe),
-        "pythonw.exe" if py_exe.lower().endswith("python.exe") else "python.exe")
-    wanted = {py_exe.lower()}
-    if os.path.exists(sibling):
-        wanted.add(sibling.lower())
-
-    found: list = []
+    wanted = {e.lower() for e in _interpreter_exes()}
     try:
         r = subprocess.run(
             ["netsh", "advfirewall", "firewall", "show", "rule",
@@ -181,22 +210,46 @@ def blocking_firewall_rules() -> list:
             capture_output=True, text=True, encoding="utf-8",
             errors="replace", timeout=20,
         )
-        name = program = None
-        for line in r.stdout.splitlines():
-            if line.startswith("Rule Name:"):
-                name = line.split(":", 1)[1].strip()
-                program = None
-            elif line.startswith("Program:"):
-                program = line.split(":", 1)[1].strip().lower()
-            elif line.startswith("Action:"):
-                if (name and program and program in wanted
-                        and line.split(":", 1)[1].strip().lower() == "block"
-                        and (name, program) not in found):
-                    found.append((name, program))
     except Exception as exc:
+        # Not cached: an unreadable firewall is not the same as an empty one.
         print(f"[Dashboard] could not read the firewall rules: {exc}")
+        return []
+    found = _parse_blocking_rules(r.stdout, wanted)
     _BLOCK_CACHE = found
     return found
+
+
+def _firewall_problems(missing_ports: list, prog_missing: bool, blocks: list) -> list:
+    """What is still wrong, as sentences. An empty list means the phone can
+    reach the dashboard. Pure, so it can be tested on any machine.
+    """
+    problems = [f"no allow rule for port {pt}" for pt in missing_ports]
+    if prog_missing:
+        problems.append("no allow rule for Python")
+    if blocks:
+        names = ", ".join(sorted({n for n, _ in blocks}))
+        problems.append(f"Windows block rule(s) still present: {names}")
+    return problems
+
+
+def _wait_for(check, timeout: float, interval: float = 2.0,
+              sleep=None, clock=None) -> bool:
+    """Poll `check` until it is true or `timeout` seconds pass.
+
+    Replaces a single fixed sleep followed by a check. The UAC dialog waits for
+    a person, so any fixed delay is either too short, which reports a failure
+    that has not happened, or a guess about how long the person takes.
+    """
+    import time
+    sleep = sleep or time.sleep
+    clock = clock or time.monotonic
+    end = clock() + timeout
+    while True:
+        if check():
+            return True
+        if clock() >= end:
+            return False
+        sleep(interval)
 
 
 def _ensure_network_access(*ports: int) -> None:
@@ -215,28 +268,10 @@ def _ensure_network_access(*ports: int) -> None:
     if sys.platform == "win32":
         import ctypes, time
 
-        # Every port in one pass. Called once per port, this asked for
-        # elevation once per port — two UAC dialogs for one dashboard, and two
-        # racing .bat files whose output interleaved into contradictory
-        # messages on the console.
+        # Port rules are scoped to the Private profile (see the add calls below).
         port_rules = {pt: f"JARVIS Dashboard Port {pt}" for pt in ports}
         prog_rule  = "JARVIS Dashboard Python"
-
-        # BOTH interpreters, because the app runs under either one.
-        #
-        # THIS IS THE BUG THAT MADE THE PHONE UNREACHABLE FROM THE SHORTCUT.
-        #     Started from an editor the app runs under `python.exe`. The
-        #     desktop shortcut targets `pythonw.exe`, so that there is no
-        #     console window — a different executable, and Windows Firewall
-        #     rules are per-executable. Allowing one said nothing about the
-        #     other, and the symptom was a dashboard that worked when launched
-        #     one way and "refused to connect" when launched the other, on the
-        #     same machine and the same network.
-        py_exe = sys.executable
-        _sibling = os.path.join(os.path.dirname(py_exe),
-                                "pythonw.exe" if py_exe.lower().endswith("python.exe")
-                                else "python.exe")
-        py_exes = [py_exe] + ([_sibling] if os.path.exists(_sibling) else [])
+        py_exes    = _interpreter_exes()
 
         def _netsh_rule_exists(name: str) -> bool:
             try:
@@ -261,53 +296,56 @@ def _ensure_network_access(*ports: int) -> None:
             except Exception:
                 return False
 
-        # One implementation, at module scope — see blocking_firewall_rules().
-        # There were briefly two, and they disagreed about their return type,
-        # which surfaced as 'too many values to unpack' in the error path.
-        blocked      = blocking_firewall_rules()
-        missing_ports = [pt for pt, nm in port_rules.items()
-                         if not _netsh_rule_exists(nm)]
-        need_prog    = not _netsh_rule_exists(prog_rule)
-        need_private = _network_is_public()
+        def _current_state():
+            """What the firewall says right now. Never from the cache: a check
+            made from a cached answer reports the state before the change."""
+            missing = [pt for pt, nm in port_rules.items() if not _netsh_rule_exists(nm)]
+            prog_missing = not _netsh_rule_exists(prog_rule)
+            blocks = blocking_firewall_rules(fresh=True)
+            return _firewall_problems(missing, prog_missing, blocks), missing, prog_missing, blocks
+
+        problems, missing_ports, need_prog, blocked = _current_state()
+
+        # The network profile is reported, never changed. Converting a Public
+        # network to Private relaxes the firewall for the whole machine, and
+        # that decision belongs to whoever owns the machine.
+        if _network_is_public():
+            print("[Dashboard] This network is set to Public. The dashboard's "
+                  "firewall rules apply to Private networks only, so the phone "
+                  "will not reach it here. If this is your own network, set it "
+                  "to Private in Windows Settings.")
+
+        if not problems:
+            return  # already fully configured
 
         if blocked:
             print(f"[Dashboard] Windows is BLOCKING inbound connections to "
                   f"{', '.join(sorted(set(os.path.basename(e) for e in py_exes)))} "
-                  f"({len(blocked)} block rule(s)). Your phone cannot reach the "
-                  f"dashboard until those are removed — asking for permission "
-                  f"to do that now.")
+                  f"via {len(blocked)} block rule(s): "
+                  f"{', '.join(sorted({n for n, _ in blocked}))}.")
+            print("[Dashboard] Setup will ask Windows to REMOVE those rules. "
+                  "Declining the prompt leaves the phone dashboard unreachable, "
+                  "and nothing else is affected.")
 
-        if not missing_ports and not need_prog and not need_private and not blocked:
-            return  # already fully configured
-
-        # Build a .bat file — netsh + powershell, runs fast when elevated
+        # Build a .bat file. Its exit code is NOT trusted: it belongs to the last
+        # command, and a failed netsh line can still leave it at 0. The firewall
+        # is read back afterwards instead.
         bat_lines = ["@echo off"]
-        if need_private:
-            bat_lines.append(
-                'powershell -NoProfile -NonInteractive -Command "'
-                'Get-NetConnectionProfile | '
-                "Where-Object {$_.NetworkCategory -eq 'Public'} | "
-                'Set-NetConnectionProfile -NetworkCategory Private"'
-            )
         for pt in missing_ports:
             bat_lines.append(
                 f'netsh advfirewall firewall add rule '
                 f'name="{port_rules[pt]}" protocol=TCP dir=in '
-                f'localport={pt} action=allow'
+                f'localport={pt} action=allow profile=private'
             )
-        # Remove the blocks FIRST. Adding an allow rule beside a block rule
-        # changes nothing at all — Windows resolves the conflict in the block's
-        # favour — so this is the line that actually fixes the connection.
+        # Remove the blocks FIRST: an allow rule beside a block rule changes
+        # nothing, because the block wins.
         for rule_name in blocked:
             bat_lines.append(
                 f'netsh advfirewall firewall delete rule '
                 f'name="{rule_name}" dir=in'
             )
-
         if need_prog or blocked:
-            # One allow rule per interpreter. `add rule` with an existing name
-            # appends rather than replacing, so deleting first keeps this from
-            # accumulating a new copy on every launch.
+            # `add rule` with an existing name appends, so delete first.
             bat_lines.append(
                 f'netsh advfirewall firewall delete rule name="{prog_rule}" dir=in'
             )
@@ -315,15 +353,8 @@ def _ensure_network_access(*ports: int) -> None:
                 bat_lines.append(
                     f'netsh advfirewall firewall add rule '
                     f'name="{prog_rule}" dir=in action=allow '
-                    f'program="{exe}" enable=yes'
+                    f'program="{exe}" enable=yes profile=private'
                 )
-
-        # Say what will be attempted, so a UAC prompt nobody expected has a
-        # reason attached to it in the terminal.
-        if blocked:
-            print("[Dashboard] The Windows prompt about to appear is JARVIS "
-                  "removing those block rules. Declining it leaves the phone "
-                  "dashboard unreachable, and nothing else is affected.")
 
         bat_body = "\r\n".join(bat_lines) + "\r\n"
         fd, bat_path = tempfile.mkstemp(suffix=".bat", prefix="jarvis_fw_")
@@ -337,71 +368,56 @@ def _ensure_network_access(*ports: int) -> None:
                 pass
             return
 
-        # ── Try running directly (succeeds when already admin) ────────────────
+        # ── Try running directly (only works when already elevated) ───────────
         try:
-            r = subprocess.run(
-                [bat_path], capture_output=True, timeout=8, shell=True
-            )
-            if r.returncode == 0:
-                print(f"[Dashboard] Firewall configured for {', '.join(str(pt) for pt in ports)}.")
-                try:
-                    os.unlink(bat_path)
-                except Exception:
-                    pass
-                return
+            subprocess.run([bat_path], capture_output=True, timeout=8, shell=True)
         except Exception:
             pass
+        problems = _current_state()[0]
+        if not problems:
+            print(f"[Dashboard] Firewall configured for {', '.join(str(pt) for pt in ports)}.")
+            try:
+                os.unlink(bat_path)
+            except Exception:
+                pass
+            return
 
-        # ── ShellExecuteW: native UAC elevation (most reliable on Windows) ────
-        # ShellExecuteW with verb "runas" always shows the UAC dialog regardless
-        # of UAC level settings. Non-blocking — uvicorn is already running.
+        # ── ShellExecuteW: native UAC elevation ───────────────────────────────
         print("[Dashboard] One-time network setup required.")
         print("[Dashboard] >>> A Windows security dialog will appear — click 'Yes' <<<")
         try:
             ret = ctypes.windll.shell32.ShellExecuteW(
-                None,       # hwnd  (no parent window)
-                "runas",    # verb  (request elevation)
-                bat_path,   # file  (our .bat)
+                None,       # hwnd
+                "runas",    # verb (request elevation)
+                bat_path,   # file
                 None,       # params
                 None,       # working dir
-                0,          # SW_HIDE (run without a visible cmd window)
+                0,          # SW_HIDE
             )
             if int(ret) > 32:
-                # ShellExecuteW returns immediately; bat finishes in ~1 second.
-                # Sleep briefly so the rules are in place before the first retry.
-                time.sleep(2)
-                # CHECK, DO NOT ASSUME. ShellExecuteW succeeding means the
-                # dialog was accepted, not that netsh did what was asked — and
-                # the whole point of this release is not to report an outcome
-                # nobody looked at.
-                still = blocking_firewall_rules()
-                if still:
-                    print("[Dashboard] ⚠️  Windows is STILL blocking inbound "
-                          "connections to this interpreter.")
-                    print("[Dashboard] ⚠️  Remove these by hand in Windows "
-                          "Defender Firewall > Inbound Rules: "
-                          + ", ".join(sorted({n for n, _ in still})))
-                else:
+                # The dialog stays up until someone answers it, so poll for the
+                # result rather than reading once after a guessed delay.
+                if _wait_for(lambda: not _current_state()[0], timeout=120):
                     print(f"[Dashboard] Network setup complete — "
-                          f"{', '.join(str(pt) for pt in ports)} open.")
+                          f"{', '.join(str(pt) for pt in ports)} open for private networks.")
                     print("[Dashboard] Refresh your phone browser to connect.")
+                else:
+                    left = _current_state()[0]
+                    print("[Dashboard] ⚠️  Firewall setup is NOT complete:")
+                    for p in left:
+                        print(f"[Dashboard]     - {p}")
+                    print("[Dashboard] Fix these by hand in Windows Defender "
+                          "Firewall > Inbound Rules, or restart JARVIS and accept "
+                          "the prompt.")
             else:
                 print("[Dashboard] Setup was not allowed.")
-                if blocked:
-                    print("[Dashboard] Your phone CANNOT reach the dashboard "
-                          "until this is done: Windows has block rules for "
-                          + ", ".join(sorted({n for n, _ in blocked}))
-                          + " which override every allow rule.")
-                    print("[Dashboard] Either restart JARVIS and accept the "
-                          "prompt, or delete those rules in Windows Defender "
-                          "Firewall > Inbound Rules.")
-                else:
-                    print("[Dashboard] Phone connections may fail until JARVIS "
-                          "is run as Administrator.")
+                for p in problems:
+                    print(f"[Dashboard]     - {p}")
+                print("[Dashboard] The phone cannot reach the dashboard until "
+                      "these are done.")
         except Exception as e:
             print(f"[Dashboard] Firewall setup error: {e}")
         finally:
-            # Cleanup after the bat has had time to run
             def _cleanup(path: str) -> None:
                 time.sleep(5)
                 try:
